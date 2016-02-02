@@ -1,0 +1,523 @@
+{
+  "paragraphs": [
+    {
+      "text": "def run{\nimport java.io\nimport java.text.SimpleDateFormat\nimport java.util.Date\n\nimport java.util.{Locale, Date}\n\nimport akka.actor.FSM.LogEntry\nimport org.apache.spark.rdd.RDD\nimport org.apache.spark.{SparkContext, SparkConf}\n\nimport scala.collection.immutable.HashMap\nimport scala.io.Source\nimport scala.reflect.io.File\nimport scala.util.matching.Regex\n\n/**\n * Created by preethi on 10/10/15.\n */\n\n\n\nclass LogEntry(layer: String, node: String, filePath: String) extends Serializable {\n    var layerFile: String \u003d layer\n    val nodeName: String \u003d node\n    val absolutePath: String \u003d filePath\n  }\n\n  class EntryExitTiming(nodeName: String, commandName: String, entryTime: Date, exitTime: Date) extends Serializable {\n    var node: String \u003d nodeName;\n    var command: String \u003d commandName;\n    var startTime: Date \u003d entryTime;\n    var endTime: Date \u003d exitTime;\n    //println(node+ \" \" + commandName+ \" \"+ entryTime+\" \"+ exitTime)\n\n  }\n  \n    var layerDetailsMap \u003d new HashMap[String,RDD[String]]()\n  var nodeLvlMap \u003d new HashMap[String,Map[String,RDD[String]]]()\n\n  var nodeDetailsMap \u003d new HashMap[String,RDD[String]]()\n  var layerLvlMap \u003d new HashMap[String,Map[String,RDD[String]]]()\n  def LogAnalaysisDetails(errorTimeStamp: String, errorString: RDD[String], nodeName: String, layer: String){\n    layerDetailsMap +\u003d (layer -\u003e errorString)\n    nodeLvlMap+\u003d (nodeName -\u003e layerDetailsMap)\n\n    \n    // var nodeLvlMap \u003d new HashMap[String,Map[String,RDD[String]]]()\n    if(!layerLvlMap.contains(layer)){\n      nodeDetailsMap +\u003d (nodeName -\u003e errorString)\n      layerLvlMap+\u003d (layer -\u003e nodeDetailsMap)\n    }else{\n      var nodeMap \u003d layerLvlMap(layer) // (nodeName -\u003e errorString)\n      nodeMap +\u003d (nodeName -\u003e errorString)\n      layerLvlMap+\u003d (layer -\u003e nodeMap)\n    }\n\n  }\n\n\n  val EMPTY \u003d new LogEntry(\"ignore\", \"ignore\", \"ignore\")\n\n\n  var startIocliTracing \u003d false;\n  def verifyLinesIocliTimeRange(line: String, timing: EntryExitTiming, cmd: String): Boolean \u003d {\n    if(line.contains(\"Command \"+cmd+\"  Started at \")) {\n      startIocliTracing \u003d true\n    } else if(line.contains(\"Command \"+cmd+\" Ended at \")) {\n      startIocliTracing \u003d false\n    } else if(startIocliTracing) {\n      return true;\n    }\n    return false\n  }\n\n  def containsError(line: String): Boolean \u003d {\n    val regex \u003d new Regex(\"rc\\\\s+\u003d\\\\s+[^0]\\\\d+\")\n    val lineAccurance \u003d regex findFirstIn line\n    if(lineAccurance !\u003d None) {\n      return true\n    }\n    return false\n  }\n\n  def analyzeIoscli(logEntry: LogEntry, timing: EntryExitTiming, cmd: String): Unit \u003d {\n    val format \u003d new java.text.SimpleDateFormat(\" MMM  dd yyyy, EEE, hh:mm:ss\")\n    var startTracing \u003d false\n    val inputFile: RDD[String] \u003d sc.textFile(logEntry.absolutePath, 1).cache()\n    val filesToBeTraced: RDD[String] \u003d inputFile.filter(line \u003d\u003e verifyLinesIocliTimeRange(line, timing, cmd))\n\n    val errorIndicationline: RDD[String] \u003d filesToBeTraced.filter(line \u003d\u003e containsError(line))\n   // errorIndicationline.foreach(println)\n\n    LogAnalaysisDetails(\"\",errorIndicationline,logEntry.nodeName,logEntry.layerFile)\n  }\n\n  def errorInPool(line: String): Boolean \u003d {\n    val regex \u003d new Regex(\"rc\u003d[^0]\\\\s+\")\n    val nonZerolineaccurance \u003d regex findFirstIn line\n    if(nonZerolineaccurance !\u003d None) {\n\n      return true\n    }\n    return false\n  }\n\n  def PoolCmdDateTimeFilter(line: String, startTime: Date, endTime: Date): Boolean \u003d {\n\n    val format \u003d new java.text.SimpleDateFormat(\"s\")\n    val regex \u003d new Regex(\":\\\\d{10}:\")\n    var firstAccurance \u003d regex findFirstIn line\n    if (firstAccurance !\u003d None) {\n      val dateStamp \u003d format.parse(firstAccurance.get.split(\":\").toList(1))\n      if (dateStamp.equals(startTime) || dateStamp.equals(endTime) || (dateStamp.after(startTime) \u0026\u0026 dateStamp.before(endTime))) {\n        return true\n      }\n    }\n    return false\n  }\n\n  def analyzepool(logEntry: LogEntry,timing: EntryExitTiming, cmd: String): Unit \u003d {\n\n\n    val absolutePath: RDD[String] \u003d sc.textFile(logEntry.absolutePath, 1).cache()\n\n    val filteredLinesByTime: RDD[String] \u003d absolutePath.filter(line \u003d\u003e PoolCmdDateTimeFilter(line, timing.startTime, timing.endTime))\n\n    val poolErrorLines: RDD[String] \u003d filteredLinesByTime.filter(line \u003d\u003e errorInPool(line))\n\n    LogAnalaysisDetails(\"\", poolErrorLines,logEntry.nodeName,logEntry.layerFile)\n\n  }\n\n  def parseLogEntry(logentry: LogEntry,timing: EntryExitTiming, cmd: String): Unit \u003d {\n\n    logentry.layerFile match {\n      case \"pool.log\" \u003d\u003e analyzepool(logentry, timing, cmd)\n      case \"ioscli_global.trace\" \u003d\u003e analyzeIoscli(logentry, timing, cmd)\n      case \"vioCmd.log\" \u003d\u003e analyzeviocmd(logentry, timing)\n      case \"syslog.caa\" \u003d\u003e analyzesyscaa(logentry, timing)\n      case \"cfglog\" \u003d\u003e analyzeCfgLog(logentry)\n      case default \u003d\u003e\n\n    }\n  }\n\n  def analyzeCfgLog(logEntry: LogEntry): Unit \u003d {\n    val errorLines: RDD[String] \u003d filterErrorCfgLog(logEntry.absolutePath, sc)\n    LogAnalaysisDetails(\"\", errorLines,logEntry.nodeName,logEntry.layerFile)\n  //  println(\"\"+\" \"+errorLines+ \" \"+ logEntry.nodeName + \"  \"+logEntry.layerFile)\n  }\n\n  def filterErrorCfgLog(filepath: String, sc: SparkContext): RDD[String] \u003d{\n    //    println(\"--\u003efilterVioLogBetweenTime. startDateTime:\", startDateTime , \"endDateTime:\", endDateTime)\n\n    val inputFile: RDD[String] \u003d sc.textFile(filepath, 1).cache()\n    val filteredlines: RDD[String] \u003d inputFile.filter(line \u003d\u003e filterCfglogErrors(line))\n    //    filteredlines.foreach(println)\n    return filteredlines\n\n  }\n\n\n  def filterCfglogErrors(eachline: String): Boolean \u003d {\n\n    var ret \u003d false\n\n    val caa_error_pattern \u003d new Regex(\"Error\")\n    val line \u003d caa_error_pattern findFirstIn eachline\n\n    if(line!\u003dNone){\n      ret \u003d true\n    }\n    return ret\n\n  }\n\n  def vioCmdDateTimeFilter(violine: String, startDateTime: Date, endDateTime: Date): Boolean \u003d {\n\n    //    println(\"--\u003evioCmdDateTimeFilter\")\n\n    var ret \u003d false\n\n    val date_pattern \u003d new Regex(\"(Jan|Feb|March|April|May|June|July|Aug|Sep|Oct|Nov|Dec)(\\\\s+)(\\\\d{1,2})(\\\\s+)(\\\\d{4}),\" +\n      \"\\\\s+(\\\\d{2}):(\\\\d{2}):(\\\\d{2})\")\n    val vioSdf \u003d new SimpleDateFormat(\"MMM d yyyy, HH:mm:ss\", Locale.ENGLISH)\n    val line \u003d date_pattern findFirstIn violine\n    if(line!\u003dNone){\n\n      val logLineDate \u003d vioSdf.parse(line.get)\n      if(logLineDate.equals(startDateTime) || logLineDate.equals(endDateTime) || (logLineDate.after(startDateTime) \u0026\u0026 logLineDate.before(endDateTime))){\n        ret \u003d true\n        //        println(true)\n      }\n    }\n    //    println(\"\u003c--vioCmdDateTimeFilter. ret:\",ret)\n\n    return ret\n\n  }\n\n  def nonZeroRc(eachline: String): Boolean \u003d {\n\n    var ret \u003d false\n\n    val rc_nonzero_pattern \u003d new Regex(\"rc\\\\s+[^0]\\\\d+\")\n    val line \u003d rc_nonzero_pattern findFirstIn eachline\n\n    if(line!\u003dNone){\n      ret \u003d true\n    }\n    return ret\n\n  }\n\n  def filterVioLogBetweenTime(filepath: String, sc: SparkContext, startDateTime: Date, endDateTime: Date): RDD[String] \u003d{\n    //    println(\"--\u003efilterVioLogBetweenTime. startDateTime:\", startDateTime , \"endDateTime:\", endDateTime)\n\n    val inputFile: RDD[String] \u003d sc.textFile(filepath, 1).cache()\n    val filteredlines: RDD[String] \u003d inputFile.filter(line \u003d\u003e vioCmdDateTimeFilter(line, startDateTime, endDateTime))\n    //    filteredlines.foreach(println)\n    return filteredlines\n\n  }\n\n  def filterErrorVioLog(filteredlines: RDD[String]): RDD[String] \u003d{\n    //    println(\"--\u003efilterVioLogBetweenTime. startDateTime:\", startDateTime , \"endDateTime:\", endDateTime)\n    val nonZeroRClines: RDD[String] \u003d filteredlines.filter(line \u003d\u003e nonZeroRc(line))\n    //    nonZeroRClines.foreach(println)\n    return nonZeroRClines\n\n  }\n  def analyzeviocmd(logEntry: LogEntry,timing: EntryExitTiming): Unit \u003d {\n    //    println(\"Analyzing pool\"+ timing)\n    val filteredlines: RDD[String] \u003d filterVioLogBetweenTime(logEntry.absolutePath, sc, timing.startTime, timing.endTime)\n    val errLines: RDD[String] \u003d filterErrorVioLog(filteredlines)\n    LogAnalaysisDetails(\"\", errLines,logEntry.nodeName,logEntry.layerFile)\n  }\n\n\n  def analyzesyscaa(logEntry: LogEntry,timing: EntryExitTiming): Unit \u003d {\n    val filteredlines: RDD[String] \u003d filterSyscaaBetweenTime(logEntry.absolutePath, sc, timing.startTime, timing.endTime)\n    val syscaaErrorLines: RDD[String] \u003d filterErrorSyscaaLog(filteredlines)\n    LogAnalaysisDetails(\"\", syscaaErrorLines,logEntry.nodeName,logEntry.layerFile)\n    println(\"\"+\" \"+filteredlines+ \" \"+ logEntry.nodeName + \"  \"+logEntry.layerFile)\n  }\n\n\n  def filterSyscaaBetweenTime(filepath: String, sc: SparkContext, startDateTime: Date, endDateTime: Date): RDD[String] \u003d{\n    //    println(\"--\u003efilterVioLogBetweenTime. startDateTime:\", startDateTime , \"endDateTime:\", endDateTime)\n\n    val inputFile: RDD[String] \u003d sc.textFile(filepath, 1).cache()\n    val filteredlines: RDD[String] \u003d inputFile.filter(line \u003d\u003e syscaaDateTimeFilter(line, startDateTime, endDateTime))\n    //    filteredlines.foreach(println)\n    return filteredlines\n\n  }\n\n  def syscaaDateTimeFilter(syslogLine: String, startDateTime: Date, endDateTime: Date): Boolean \u003d {\n\n    //    println(\"--\u003evioCmdDateTimeFilter\")\n\n    var ret \u003d false\n\n    val date_pattern \u003d new Regex(\"(Jan|Feb|March|April|May|June|July|Aug|Sep|Oct|Nov|Dec)(\\\\s+)(\\\\d{1,2})(\\\\s+)\" +\n      \"(\\\\d{2}):(\\\\d{2}):(\\\\d{2})\")\n    val syssmd \u003d new SimpleDateFormat(\"MMM d HH:mm:ss\", Locale.ENGLISH)\n    val covertedStartTime \u003d syssmd.parse(syssmd.format(startDateTime))\n    val covertedEndTime \u003d syssmd.parse(syssmd.format(endDateTime))\n    val line \u003d date_pattern findFirstIn syslogLine\n    if(line!\u003dNone){\n\n      var logLineDate \u003d syssmd.parse(line.get)\n\n      if(logLineDate.equals(covertedStartTime) || logLineDate.equals(covertedEndTime) || (logLineDate.after(covertedStartTime) \u0026\u0026 logLineDate.before(covertedEndTime))){\n        ret \u003d true\n      }\n    }\n    //    println(\"\u003c--vioCmdDateTimeFilter. ret:\",ret)\n\n    return ret\n\n  }\n\n\n  def filterErrorSyscaaLog(filteredlines: RDD[String]): RDD[String] \u003d{\n    //    println(\"--\u003efilterVioLogBetweenTime. startDateTime:\", startDateTime , \"endDateTime:\", endDateTime)\n    val caaErrors: RDD[String] \u003d filteredlines.filter(line \u003d\u003e filterCaaErrors(line))\n    //    nonZeroRClines.foreach(println)\n    //    print\n    return caaErrors\n\n  }\n\n  def filterCaaErrors(eachline: String): Boolean \u003d {\n\n    var ret \u003d false\n\n    val caa_error_pattern \u003d new Regex(\"caa:err\")\n    val line \u003d caa_error_pattern findFirstIn eachline\n\n    if(line!\u003dNone){\n      ret \u003d true\n    }\n    return ret\n\n  }\n\n\n  def parseMainFile(file: io.File, command: String): EntryExitTiming \u003d {\n\n    val absoluteFile: RDD[String] \u003d sc.textFile(file.getAbsolutePath, 1).cache()\n    //val absoluteFile \u003d file.getAbsoluteFile()\n    val fileName \u003d file.getName()\n    val nodeName \u003d fileName.split(\"\\\\.\").toList.last\n\n    var entryTime \u003d new Date()\n    var exitTime \u003d new Date()\n    val format \u003d new java.text.SimpleDateFormat(\" MMM  dd yyyy, EEE, hh:mm:ss\")\n\n    val filteredlinesStart: RDD[String] \u003d absoluteFile.filter(line \u003d\u003e line.contains(\"Command \"+command+\"  Started at \"))\n    val filteredlinesExit: RDD[String] \u003d absoluteFile.filter(line \u003d\u003e line.contains(\"Command \"+command+\" Ended at \"))\n\n\n    if(filteredlinesStart.count()!\u003d0) {\n      entryTime \u003d format.parse(filteredlinesStart.first().split(\"Started at\").toList.last.split(\"\u003e\u003e\u003e\u003e\u003e\u003e\").toList.last)\n    }\n    if(filteredlinesExit.count()!\u003d0) {\n      exitTime \u003d format.parse(filteredlinesExit.first().split(\"Ended at\").toList.last.split(\"\u003e\u003e\u003e\u003e\u003e\u003e\").toList.last)\n    }\n\n    println(entryTime + \"***************\" + exitTime)\n\n\n    new EntryExitTiming(nodeName, command, entryTime, exitTime)\n  }\n\n  def parseConfFile(logLocation: String, cmd: String): LogEntry \u003d {\n\n    val filesInLocation \u003d new java.io.File(logLocation).listFiles()\n    var timing \u003d new EntryExitTiming(\"\", \"\", new Date(), new Date())\n    filesInLocation.toList.foreach(mainFile \u003d\u003e if (mainFile.getName.contains(\"ioscli\")) {\n      timing \u003d parseMainFile(mainFile, cmd)\n    })\n\n    for (file \u003c- filesInLocation) {\n      val filename \u003d file.getName()\n      val nodeName \u003d filename.split(\"\\\\.\").toList.last\n      val logentry \u003d new LogEntry(filename.replaceAll((\"\\\\.\" + nodeName), \"\"), nodeName, file.getAbsolutePath)\n      parseLogEntry(logentry, timing, cmd);\n    }\n    new LogEntry(\"sucess\", \"success\", \"success\")\n\n  }\n\n  \n\n\n\n// }\n// def run{\n    // spark.driver.allowMultipleContexts \u003d true\n \nval filename \u003d \"/home/preethi/edrive/esd_hackathon/pv_add_cmds/log_conf.txt\"\n    for (line \u003c- Source.fromFile(filename).getLines()) {\n      parseConfFile(line, \"pv\")\n    }\n\n\n\n    val node1Map \u003d nodeLvlMap(\"node1\")\n    val node1CountMap \u003d node1Map map { case (k, v) \u003d\u003e k -\u003e (v.count()) }\n//\n    // println(\"Here\")\n    // val newdf \u003d sqlContext.createDataFrame(node1Map).toDF(\"LayerName\", \"ErrorCount\").show()\n//\n    var node2Map \u003d nodeLvlMap(\"node2\")\n    val node2CountMap \u003d node2Map map { case (k, v) \u003d\u003e k -\u003e (v.count()) }\n  //  node2CountMap foreach {case (key, value) \u003d\u003e println (key + \"--\u003e\" + value)}\n\n    var node3Map \u003d nodeLvlMap(\"node3\")\n    val node3CountMap \u003d node3Map map { case (k, v) \u003d\u003e k -\u003e (v.count()) }\n  //  node3CountMap foreach {case (key, value) \u003d\u003e println (key + \"--\u003e\" + value)}\n\n    var node4Map \u003d nodeLvlMap(\"node4\")\n    val node4CountMap \u003d node4Map map { case (k, v) \u003d\u003e k -\u003e (v.count()) }\n   // node4CountMap foreach {case (key, value) \u003d\u003e println (key + \"--\u003e\" + value)}\n    \n    val node1 \u003d sc.parallelize(node1CountMap.toSeq)\n    val df1 \u003d sqlContext.createDataFrame(node1)\n    \n    println(\"\\nnode1\")\n    df1.toDF(\"LayerName\", \"ErrorCount\").show()\n    df1.toDF(\"LayerName\", \"ErrorCount\").registerTempTable(\"node1\")\n    \n    println(\"\\nnode2\")\n    val node2 \u003d sc.parallelize(node2CountMap.toSeq)\n    val df2 \u003d sqlContext.createDataFrame(node2)\n    df2.toDF(\"LayerName\", \"ErrorCount\").registerTempTable(\"node2\")\n    df2.toDF(\"LayerName\", \"ErrorCount\").show()\n    \n    println(\"\\nnode3\")\n    val node3 \u003d sc.parallelize(node3CountMap.toSeq)\n    val df3 \u003d sqlContext.createDataFrame(node3)\n    df3.toDF(\"LayerName\", \"ErrorCount\").registerTempTable(\"node3\")\n    df3.toDF(\"LayerName\", \"ErrorCount\").show()\n    \n    println(\"\\nnode4\")\n    val node4 \u003d sc.parallelize(node4CountMap.toSeq)\n    val df4 \u003d sqlContext.createDataFrame(node4)\n    df4.toDF(\"LayerName\", \"ErrorCount\").registerTempTable(\"node4\")\n    df4.toDF(\"LayerName\", \"ErrorCount\").show()\n    \n    var ioscliMap \u003d layerLvlMap(\"ioscli_global.trace\")\n    val ioscliCountMap \u003d ioscliMap map { case (k, v) \u003d\u003e k -\u003e (v.count()) }\n    ioscliCountMap foreach {case (key, value) \u003d\u003e println (key + \"--\u003e\" + value)}\n\n      var cfgMap \u003d layerLvlMap(\"cfglog\")\n      val cfgCountMap \u003d cfgMap map { case (k, v) \u003d\u003e k -\u003e (v.count()) }\n    //  cfgCountMap foreach {case (key, value) \u003d\u003e println (key + \"--\u003e\" + value)}\n\n      var syslogcaa \u003d layerLvlMap(\"syslog.caa\")\n      val syslogCountMap \u003d syslogcaa map { case (k, v) \u003d\u003e k -\u003e (v.count()) }\n     // syslogCountMap foreach {case (key, value) \u003d\u003e println (key + \"--\u003e\" + value)}\n\n      var pool \u003d layerLvlMap(\"pool.log\")\n      val poolCountMap \u003d pool map { case (k, v) \u003d\u003e k -\u003e (v.count()) }\n     // poolCountMap foreach {case (key, value) \u003d\u003e println (key + \"--\u003e\" + value)}\n\n      var viocommand \u003d layerLvlMap(\"vioCmd.log\")\n      val viocmdCountMap \u003d viocommand map { case (k, v) \u003d\u003e k -\u003e (v.count()) }\n     // viocmdCountMap foreach {case (key, value) \u003d\u003e println (key + \"--\u003e\" + value)}\n     \n    println(\"\\nioscli\")  \n    val layer1 \u003d sc.parallelize(ioscliCountMap.toSeq)\n    val df5 \u003d sqlContext.createDataFrame(layer1)\n    df5.toDF(\"NodeName\", \"ErrorCount\").registerTempTable(\"ioscli\")\n    df5.toDF(\"NodeName\", \"ErrorCount\").show()\n    \n    println(\"\\ncfg\")\n    val layer2 \u003d sc.parallelize(cfgCountMap.toSeq)\n    val df6 \u003d sqlContext.createDataFrame(layer2)\n    df6.toDF(\"NodeName\", \"ErrorCount\").registerTempTable(\"cfg\")\n    df6.toDF(\"NodeName\", \"ErrorCount\").show()\n    \n    println(\"\\nsyslog\")\n    val layer3 \u003d sc.parallelize(syslogCountMap.toSeq)\n    val df7 \u003d sqlContext.createDataFrame(layer3)\n    df7.toDF(\"NodeName\", \"ErrorCount\").registerTempTable(\"syslog\")\n    df7.toDF(\"NodeName\", \"ErrorCount\").show()\n\n    println(\"\\npool\")\n    val layer4 \u003d sc.parallelize(poolCountMap.toSeq)\n    val df8 \u003d sqlContext.createDataFrame(layer4)\n    df8.toDF(\"NodeName\", \"ErrorCount\").registerTempTable(\"pool\")\n    df8.toDF(\"NodeName\", \"ErrorCount\").show()\n    \n    println(\"\\nviocmd\")\n    val layer5 \u003d sc.parallelize(viocmdCountMap.toSeq)\n    val df9 \u003d sqlContext.createDataFrame(layer4)\n    df9.toDF(\"NodeName\", \"ErrorCount\").registerTempTable(\"viocmd\")\n    df9.toDF(\"NodeName\", \"ErrorCount\").show()\n    \n      nodeLvlMap foreach{case(key,value) \u003d\u003e \n      println(\"**************Problem on the node -\u003e**********************\" + key.toUpperCase())\n      value foreach{case(key,value) \u003d\u003e \n          println(\"-\u003e  noticed in the layer -\u003e \" + key + \"Error instances --\u003e\" + value.count())\n          println(\"------------------------------------------------\")\n          value.collect().foreach(println)\n          println(\"------------------------------------------------\")\n      }\n      println(\"************************************\")\n      }\n          \n\n\n    \n    \n    };\n   \nrun;\n\n",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        }
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1444382746645_-1233818820",
+      "id": "20151009-145546_-1879484396",
+      "result": "org.apache.zeppelin.interpreter.InterpreterException: org.apache.thrift.transport.TTransportException: java.net.ConnectException: Connection refused",
+      "dateCreated": "Oct 9, 2015 2:55:46 PM",
+      "dateStarted": "Jan 29, 2016 11:36:30 AM",
+      "dateFinished": "Jan 29, 2016 11:36:30 AM",
+      "status": "ERROR",
+      "errorMessage": "org.apache.zeppelin.interpreter.remote.RemoteInterpreter.interpret(RemoteInterpreter.java:193)\norg.apache.zeppelin.interpreter.LazyOpenInterpreter.interpret(LazyOpenInterpreter.java:93)\norg.apache.zeppelin.notebook.Paragraph.jobRun(Paragraph.java:212)\norg.apache.zeppelin.scheduler.Job.run(Job.java:170)\norg.apache.zeppelin.scheduler.RemoteScheduler$JobRunner.run(RemoteScheduler.java:296)\njava.util.concurrent.Executors$RunnableAdapter.call(Executors.java:483)\njava.util.concurrent.FutureTask.run(FutureTask.java:274)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:190)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)\njava.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157)\njava.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:627)\njava.lang.Thread.run(Thread.java:798)\n",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "text": "%sql\nselect LayerName, ErrorCount from node1",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "multiBarChart",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [
+            {
+              "name": "LayerName",
+              "index": 0.0,
+              "aggr": "sum"
+            }
+          ],
+          "values": [
+            {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          ],
+          "groups": [],
+          "scatter": {
+            "xAxis": {
+              "name": "LayerName",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        }
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1444419533189_-365491000",
+      "id": "20151010-010853_1283814779",
+      "result": "org.apache.zeppelin.interpreter.InterpreterException: org.apache.thrift.transport.TTransportException: java.net.ConnectException: Connection refused",
+      "dateCreated": "Oct 10, 2015 1:08:53 AM",
+      "dateStarted": "Jan 29, 2016 11:36:30 AM",
+      "dateFinished": "Jan 29, 2016 11:36:30 AM",
+      "status": "ERROR",
+      "errorMessage": "org.apache.zeppelin.interpreter.remote.RemoteInterpreter.interpret(RemoteInterpreter.java:193)\norg.apache.zeppelin.interpreter.LazyOpenInterpreter.interpret(LazyOpenInterpreter.java:93)\norg.apache.zeppelin.notebook.Paragraph.jobRun(Paragraph.java:212)\norg.apache.zeppelin.scheduler.Job.run(Job.java:170)\norg.apache.zeppelin.scheduler.RemoteScheduler$JobRunner.run(RemoteScheduler.java:296)\njava.util.concurrent.Executors$RunnableAdapter.call(Executors.java:483)\njava.util.concurrent.FutureTask.run(FutureTask.java:274)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:190)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)\njava.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157)\njava.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:627)\njava.lang.Thread.run(Thread.java:798)\n",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "text": "%sql\nselect LayerName, ErrorCount from node2\n",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "multiBarChart",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [
+            {
+              "name": "LayerName",
+              "index": 0.0,
+              "aggr": "sum"
+            }
+          ],
+          "values": [
+            {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          ],
+          "groups": [],
+          "scatter": {
+            "xAxis": {
+              "name": "LayerName",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        }
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1444634787942_-1377155498",
+      "id": "20151012-125627_222830261",
+      "result": "org.apache.zeppelin.interpreter.InterpreterException: org.apache.thrift.transport.TTransportException: java.net.ConnectException: Connection refused",
+      "dateCreated": "Oct 12, 2015 12:56:27 PM",
+      "dateStarted": "Jan 29, 2016 11:36:30 AM",
+      "dateFinished": "Jan 29, 2016 11:36:30 AM",
+      "status": "ERROR",
+      "errorMessage": "org.apache.zeppelin.interpreter.remote.RemoteInterpreter.interpret(RemoteInterpreter.java:193)\norg.apache.zeppelin.interpreter.LazyOpenInterpreter.interpret(LazyOpenInterpreter.java:93)\norg.apache.zeppelin.notebook.Paragraph.jobRun(Paragraph.java:212)\norg.apache.zeppelin.scheduler.Job.run(Job.java:170)\norg.apache.zeppelin.scheduler.RemoteScheduler$JobRunner.run(RemoteScheduler.java:296)\njava.util.concurrent.Executors$RunnableAdapter.call(Executors.java:483)\njava.util.concurrent.FutureTask.run(FutureTask.java:274)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:190)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)\njava.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157)\njava.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:627)\njava.lang.Thread.run(Thread.java:798)\n",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "text": "%sql\nselect LayerName, ErrorCount from node3\n",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "multiBarChart",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [
+            {
+              "name": "LayerName",
+              "index": 0.0,
+              "aggr": "sum"
+            }
+          ],
+          "values": [
+            {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          ],
+          "groups": [],
+          "scatter": {
+            "xAxis": {
+              "name": "LayerName",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        }
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1444634794698_849771136",
+      "id": "20151012-125634_788154418",
+      "result": "org.apache.zeppelin.interpreter.InterpreterException: org.apache.thrift.transport.TTransportException: java.net.ConnectException: Connection refused",
+      "dateCreated": "Oct 12, 2015 12:56:34 PM",
+      "dateStarted": "Jan 29, 2016 11:36:30 AM",
+      "dateFinished": "Jan 29, 2016 11:36:30 AM",
+      "status": "ERROR",
+      "errorMessage": "org.apache.zeppelin.interpreter.remote.RemoteInterpreter.interpret(RemoteInterpreter.java:193)\norg.apache.zeppelin.interpreter.LazyOpenInterpreter.interpret(LazyOpenInterpreter.java:93)\norg.apache.zeppelin.notebook.Paragraph.jobRun(Paragraph.java:212)\norg.apache.zeppelin.scheduler.Job.run(Job.java:170)\norg.apache.zeppelin.scheduler.RemoteScheduler$JobRunner.run(RemoteScheduler.java:296)\njava.util.concurrent.Executors$RunnableAdapter.call(Executors.java:483)\njava.util.concurrent.FutureTask.run(FutureTask.java:274)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:190)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)\njava.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157)\njava.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:627)\njava.lang.Thread.run(Thread.java:798)\n",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "text": "%sql\nselect LayerName, ErrorCount from node4\n",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "multiBarChart",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [
+            {
+              "name": "LayerName",
+              "index": 0.0,
+              "aggr": "sum"
+            }
+          ],
+          "values": [
+            {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          ],
+          "groups": [],
+          "scatter": {
+            "xAxis": {
+              "name": "LayerName",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        }
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1444634850309_-1857429395",
+      "id": "20151012-125730_310922580",
+      "result": "org.apache.zeppelin.interpreter.InterpreterException: org.apache.thrift.transport.TTransportException: java.net.ConnectException: Connection refused",
+      "dateCreated": "Oct 12, 2015 12:57:30 PM",
+      "dateStarted": "Jan 29, 2016 11:36:30 AM",
+      "dateFinished": "Jan 29, 2016 11:36:30 AM",
+      "status": "ERROR",
+      "errorMessage": "org.apache.zeppelin.interpreter.remote.RemoteInterpreter.interpret(RemoteInterpreter.java:193)\norg.apache.zeppelin.interpreter.LazyOpenInterpreter.interpret(LazyOpenInterpreter.java:93)\norg.apache.zeppelin.notebook.Paragraph.jobRun(Paragraph.java:212)\norg.apache.zeppelin.scheduler.Job.run(Job.java:170)\norg.apache.zeppelin.scheduler.RemoteScheduler$JobRunner.run(RemoteScheduler.java:296)\njava.util.concurrent.Executors$RunnableAdapter.call(Executors.java:483)\njava.util.concurrent.FutureTask.run(FutureTask.java:274)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:190)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)\njava.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157)\njava.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:627)\njava.lang.Thread.run(Thread.java:798)\n",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "text": "%sql\nselect NodeName, ErrorCount from cfg\n",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "multiBarChart",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [
+            {
+              "name": "NodeName",
+              "index": 0.0,
+              "aggr": "sum"
+            }
+          ],
+          "values": [
+            {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          ],
+          "groups": [],
+          "scatter": {
+            "xAxis": {
+              "name": "NodeName",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        }
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1444634857650_-274557096",
+      "id": "20151012-125737_-178025785",
+      "result": "org.apache.zeppelin.interpreter.InterpreterException: org.apache.thrift.transport.TTransportException: java.net.ConnectException: Connection refused",
+      "dateCreated": "Oct 12, 2015 12:57:37 PM",
+      "dateStarted": "Jan 29, 2016 11:36:30 AM",
+      "dateFinished": "Jan 29, 2016 11:36:30 AM",
+      "status": "ERROR",
+      "errorMessage": "org.apache.zeppelin.interpreter.remote.RemoteInterpreter.interpret(RemoteInterpreter.java:193)\norg.apache.zeppelin.interpreter.LazyOpenInterpreter.interpret(LazyOpenInterpreter.java:93)\norg.apache.zeppelin.notebook.Paragraph.jobRun(Paragraph.java:212)\norg.apache.zeppelin.scheduler.Job.run(Job.java:170)\norg.apache.zeppelin.scheduler.RemoteScheduler$JobRunner.run(RemoteScheduler.java:296)\njava.util.concurrent.Executors$RunnableAdapter.call(Executors.java:483)\njava.util.concurrent.FutureTask.run(FutureTask.java:274)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:190)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)\njava.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157)\njava.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:627)\njava.lang.Thread.run(Thread.java:798)\n",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "text": "%sql\nselect NodeName, ErrorCount from ioscli",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "multiBarChart",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [
+            {
+              "name": "NodeName",
+              "index": 0.0,
+              "aggr": "sum"
+            }
+          ],
+          "values": [
+            {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          ],
+          "groups": [],
+          "scatter": {
+            "xAxis": {
+              "name": "NodeName",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        }
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1444634884931_-518841999",
+      "id": "20151012-125804_-804745052",
+      "result": "org.apache.zeppelin.interpreter.InterpreterException: org.apache.thrift.transport.TTransportException: java.net.ConnectException: Connection refused",
+      "dateCreated": "Oct 12, 2015 12:58:04 PM",
+      "dateStarted": "Jan 29, 2016 11:36:30 AM",
+      "dateFinished": "Jan 29, 2016 11:36:30 AM",
+      "status": "ERROR",
+      "errorMessage": "org.apache.zeppelin.interpreter.remote.RemoteInterpreter.interpret(RemoteInterpreter.java:193)\norg.apache.zeppelin.interpreter.LazyOpenInterpreter.interpret(LazyOpenInterpreter.java:93)\norg.apache.zeppelin.notebook.Paragraph.jobRun(Paragraph.java:212)\norg.apache.zeppelin.scheduler.Job.run(Job.java:170)\norg.apache.zeppelin.scheduler.RemoteScheduler$JobRunner.run(RemoteScheduler.java:296)\njava.util.concurrent.Executors$RunnableAdapter.call(Executors.java:483)\njava.util.concurrent.FutureTask.run(FutureTask.java:274)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:190)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)\njava.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157)\njava.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:627)\njava.lang.Thread.run(Thread.java:798)\n",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "text": "%sql\nselect NodeName, ErrorCount from syslog",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "multiBarChart",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [
+            {
+              "name": "NodeName",
+              "index": 0.0,
+              "aggr": "sum"
+            }
+          ],
+          "values": [
+            {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          ],
+          "groups": [],
+          "scatter": {
+            "xAxis": {
+              "name": "NodeName",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        }
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1444634899898_-262367724",
+      "id": "20151012-125819_-1825039012",
+      "result": "org.apache.zeppelin.interpreter.InterpreterException: org.apache.thrift.transport.TTransportException: java.net.ConnectException: Connection refused",
+      "dateCreated": "Oct 12, 2015 12:58:19 PM",
+      "dateStarted": "Jan 29, 2016 11:36:30 AM",
+      "dateFinished": "Jan 29, 2016 11:36:30 AM",
+      "status": "ERROR",
+      "errorMessage": "org.apache.zeppelin.interpreter.remote.RemoteInterpreter.interpret(RemoteInterpreter.java:193)\norg.apache.zeppelin.interpreter.LazyOpenInterpreter.interpret(LazyOpenInterpreter.java:93)\norg.apache.zeppelin.notebook.Paragraph.jobRun(Paragraph.java:212)\norg.apache.zeppelin.scheduler.Job.run(Job.java:170)\norg.apache.zeppelin.scheduler.RemoteScheduler$JobRunner.run(RemoteScheduler.java:296)\njava.util.concurrent.Executors$RunnableAdapter.call(Executors.java:483)\njava.util.concurrent.FutureTask.run(FutureTask.java:274)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:190)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)\njava.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157)\njava.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:627)\njava.lang.Thread.run(Thread.java:798)\n",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "text": "%sql\nselect NodeName, ErrorCount from pool\n",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "multiBarChart",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [
+            {
+              "name": "NodeName",
+              "index": 0.0,
+              "aggr": "sum"
+            }
+          ],
+          "values": [
+            {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          ],
+          "groups": [],
+          "scatter": {
+            "xAxis": {
+              "name": "NodeName",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        }
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1444634923196_-834843439",
+      "id": "20151012-125843_1159030105",
+      "result": "org.apache.zeppelin.interpreter.InterpreterException: org.apache.thrift.transport.TTransportException: java.net.ConnectException: Connection refused",
+      "dateCreated": "Oct 12, 2015 12:58:43 PM",
+      "dateStarted": "Jan 29, 2016 11:36:30 AM",
+      "dateFinished": "Jan 29, 2016 11:36:30 AM",
+      "status": "ERROR",
+      "errorMessage": "org.apache.zeppelin.interpreter.remote.RemoteInterpreter.interpret(RemoteInterpreter.java:193)\norg.apache.zeppelin.interpreter.LazyOpenInterpreter.interpret(LazyOpenInterpreter.java:93)\norg.apache.zeppelin.notebook.Paragraph.jobRun(Paragraph.java:212)\norg.apache.zeppelin.scheduler.Job.run(Job.java:170)\norg.apache.zeppelin.scheduler.RemoteScheduler$JobRunner.run(RemoteScheduler.java:296)\njava.util.concurrent.Executors$RunnableAdapter.call(Executors.java:483)\njava.util.concurrent.FutureTask.run(FutureTask.java:274)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:190)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)\njava.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157)\njava.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:627)\njava.lang.Thread.run(Thread.java:798)\n",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "text": "%sql\nselect NodeName, ErrorCount from viocmd",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "multiBarChart",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [
+            {
+              "name": "NodeName",
+              "index": 0.0,
+              "aggr": "sum"
+            }
+          ],
+          "values": [
+            {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          ],
+          "groups": [],
+          "scatter": {
+            "xAxis": {
+              "name": "NodeName",
+              "index": 0.0,
+              "aggr": "sum"
+            },
+            "yAxis": {
+              "name": "ErrorCount",
+              "index": 1.0,
+              "aggr": "sum"
+            }
+          }
+        }
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1444634938626_330206879",
+      "id": "20151012-125858_585917648",
+      "result": "org.apache.zeppelin.interpreter.InterpreterException: org.apache.thrift.transport.TTransportException: java.net.ConnectException: Connection refused",
+      "dateCreated": "Oct 12, 2015 12:58:58 PM",
+      "dateStarted": "Jan 29, 2016 11:36:30 AM",
+      "dateFinished": "Jan 29, 2016 11:36:30 AM",
+      "status": "ERROR",
+      "errorMessage": "org.apache.zeppelin.interpreter.remote.RemoteInterpreter.interpret(RemoteInterpreter.java:193)\norg.apache.zeppelin.interpreter.LazyOpenInterpreter.interpret(LazyOpenInterpreter.java:93)\norg.apache.zeppelin.notebook.Paragraph.jobRun(Paragraph.java:212)\norg.apache.zeppelin.scheduler.Job.run(Job.java:170)\norg.apache.zeppelin.scheduler.RemoteScheduler$JobRunner.run(RemoteScheduler.java:296)\njava.util.concurrent.Executors$RunnableAdapter.call(Executors.java:483)\njava.util.concurrent.FutureTask.run(FutureTask.java:274)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:190)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)\njava.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157)\njava.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:627)\njava.lang.Thread.run(Thread.java:798)\n",
+      "progressUpdateIntervalMs": 500
+    },
+    {
+      "text": "",
+      "config": {
+        "colWidth": 12.0,
+        "graph": {
+          "mode": "table",
+          "height": 300.0,
+          "optionOpen": false,
+          "keys": [],
+          "values": [],
+          "groups": [],
+          "scatter": {}
+        }
+      },
+      "settings": {
+        "params": {},
+        "forms": {}
+      },
+      "jobName": "paragraph_1444634952904_785162324",
+      "id": "20151012-125912_479077588",
+      "result": "org.apache.zeppelin.interpreter.InterpreterException: org.apache.thrift.transport.TTransportException: java.net.ConnectException: Connection refused",
+      "dateCreated": "Oct 12, 2015 12:59:12 PM",
+      "dateStarted": "Jan 29, 2016 11:36:30 AM",
+      "dateFinished": "Jan 29, 2016 11:36:30 AM",
+      "status": "ERROR",
+      "errorMessage": "org.apache.zeppelin.interpreter.remote.RemoteInterpreter.interpret(RemoteInterpreter.java:193)\norg.apache.zeppelin.interpreter.LazyOpenInterpreter.interpret(LazyOpenInterpreter.java:93)\norg.apache.zeppelin.notebook.Paragraph.jobRun(Paragraph.java:212)\norg.apache.zeppelin.scheduler.Job.run(Job.java:170)\norg.apache.zeppelin.scheduler.RemoteScheduler$JobRunner.run(RemoteScheduler.java:296)\njava.util.concurrent.Executors$RunnableAdapter.call(Executors.java:483)\njava.util.concurrent.FutureTask.run(FutureTask.java:274)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.access$201(ScheduledThreadPoolExecutor.java:190)\njava.util.concurrent.ScheduledThreadPoolExecutor$ScheduledFutureTask.run(ScheduledThreadPoolExecutor.java:304)\njava.util.concurrent.ThreadPoolExecutor.runWorker(ThreadPoolExecutor.java:1157)\njava.util.concurrent.ThreadPoolExecutor$Worker.run(ThreadPoolExecutor.java:627)\njava.lang.Thread.run(Thread.java:798)\n",
+      "progressUpdateIntervalMs": 500
+    }
+  ],
+  "id": "2AZG8AS4G",
+  "angularObjects": {},
+  "config": {},
+  "info": {}
+}
